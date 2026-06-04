@@ -95,7 +95,7 @@ public class Server {
             ByteArrayInputStream bais = new ByteArrayInputStream(commandData);
             ObjectInputStream ois = new ObjectInputStream(bais);
             ServerCommand command = (ServerCommand) ois.readObject();
-            System.out.println("Получена команда: " + command.getName());
+            System.out.println("Получена команда: " + command.getName() + " от " + command.getOwnerLogin());
 
             processingPool.submit(() -> {
                 Response response;
