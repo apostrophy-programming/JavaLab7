@@ -1,24 +1,27 @@
 package server;
 
 import java.nio.ByteBuffer;
+import java.nio.channels.SelectionKey;
 
 public class ClientData {
     private ByteBuffer readBuffer;
     private ByteBuffer writeBuffer;
     private boolean readingLength = true;
+    private SelectionKey selectionKey; // для синхронизации интересов
 
     public ClientData() {
         this.readBuffer = ByteBuffer.allocate(4);
     }
 
-    public ByteBuffer getReadBuffer() {
+    public synchronized ByteBuffer getReadBuffer() {
         return readBuffer;
     }
-    public ByteBuffer getWriteBuffer() {
+
+    public synchronized ByteBuffer getWriteBuffer() {
         return writeBuffer;
     }
 
-    public boolean advanceAfterRead() {
+    public synchronized boolean advanceAfterRead() {
         if (readingLength && !readBuffer.hasRemaining()) {
             readBuffer.flip();
             int dataSize = readBuffer.getInt();
@@ -31,11 +34,11 @@ public class ClientData {
         return false;
     }
 
-    public byte[] getRequestData() {
+    public synchronized byte[] getRequestData() {
         return readBuffer.array();
     }
 
-    public void prepareWrite(byte[] data) {
+    public synchronized void prepareWrite(byte[] data) {
         ByteBuffer buf = ByteBuffer.allocate(4 + data.length);
         buf.putInt(data.length);
         buf.put(data);
@@ -43,9 +46,12 @@ public class ClientData {
         this.writeBuffer = buf;
     }
 
-    public void resetForNextMessage() {
+    public synchronized void resetForNextMessage() {
         readBuffer = ByteBuffer.allocate(4);
         readingLength = true;
     }
 
+    public synchronized void setSelectionKey(SelectionKey key) {
+        this.selectionKey = key;
+    }
 }

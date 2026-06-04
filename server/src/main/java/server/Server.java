@@ -11,6 +11,9 @@ import java.nio.channels.Selector;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
 import java.util.Iterator;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ForkJoinPool;
 
 public class Server {
     private final int port;
@@ -18,12 +21,14 @@ public class Server {
     private final RealCollectionManager realCollectionManager;
     private volatile boolean running = true;
     private Thread consoleThread;
+    private final ExecutorService readPool = Executors.newCachedThreadPool();
+    private final ForkJoinPool processingPool = new ForkJoinPool();
+    private final ForkJoinPool sendPool = new ForkJoinPool();
 
     public Server(int port, String dbUrl, String dbUser, String dbPassword) {
         this.port = port;
         realCollectionManager = new RealCollectionManager(dbUrl, dbUser, dbPassword);
     }
-
 
     public void start() throws IOException {
         selector = Selector.open();
@@ -60,6 +65,7 @@ public class Server {
             System.out.println("Принято подключение от: " + clientChannel.getRemoteAddress());
             clientChannel.configureBlocking(false);
             ClientData clientData = new ClientData();
+            clientData.setSelectionKey(key);
             clientChannel.register(selector, SelectionKey.OP_READ, clientData);
         }
     }
@@ -78,27 +84,55 @@ public class Server {
         }
 
         if (clientData.advanceAfterRead()) {
-            byte[] commandData = clientData.getRequestData();
-            try {
-                ByteArrayInputStream byteArrayInputStream = new ByteArrayInputStream(commandData);
-                ObjectInputStream objectInputStream = new ObjectInputStream(byteArrayInputStream);
-                ServerCommand serverCommand = (ServerCommand) objectInputStream.readObject();
-                System.out.println("Получена команда: " + serverCommand);
+            byte[] commandData = clientData.getRequestData().clone();
+            clientData.resetForNextMessage();
+            readPool.submit(() -> processRequest(commandData, sc, clientData, key));
+        }
+    }
 
-                Response response = serverCommand.execute(realCollectionManager);
-                ByteArrayOutputStream baos = new ByteArrayOutputStream();
-                ObjectOutputStream oos = new ObjectOutputStream(baos);
-                oos.writeObject(response);
-                oos.flush();
-                byte[] responseData = baos.toByteArray();
+    private void processRequest(byte[] commandData, SocketChannel sc, ClientData clientData, SelectionKey key) {
+        try {
+            ByteArrayInputStream bais = new ByteArrayInputStream(commandData);
+            ObjectInputStream ois = new ObjectInputStream(bais);
+            ServerCommand command = (ServerCommand) ois.readObject();
+            System.out.println("Получена команда: " + command.getName());
 
-                clientData.prepareWrite(responseData);
-                key.interestOps(SelectionKey.OP_READ | SelectionKey.OP_WRITE);
+            processingPool.submit(() -> {
+                Response response;
+                try {
+                    response = command.execute(realCollectionManager);
+                } catch (Exception e) {
+                    response = new Response(new String[]{"Ошибка выполнения команды: " + e.getMessage()});
+                }
 
-                clientData.resetForNextMessage();
-            } catch (ClassNotFoundException e) {
-                System.err.println("Ошибка десериализации: " + e.getMessage());
+                Response finalResponse = response;
+                sendPool.submit(() -> sendResponse(finalResponse, sc, clientData, key));
+            });
+        } catch (Exception e) {
+            System.err.println("Ошибка при десериализации команды: " + e.getMessage());
+            Response errorResponse = new Response(new String[]{"Ошибка десериализации команды"});
+            sendPool.submit(() -> sendResponse(errorResponse, sc, clientData, key));
+        }
+    }
+
+    private void sendResponse(Response response, SocketChannel sc, ClientData clientData, SelectionKey key) {
+        try {
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            ObjectOutputStream oos = new ObjectOutputStream(baos);
+            oos.writeObject(response);
+            oos.flush();
+            byte[] responseData = baos.toByteArray();
+
+            clientData.prepareWrite(responseData);
+
+            synchronized (key) {
+                if (key.isValid()) {
+                    key.interestOps(SelectionKey.OP_READ | SelectionKey.OP_WRITE);
+                    selector.wakeup();
+                }
             }
+        } catch (IOException e) {
+            System.err.println("Ошибка подготовки ответа для " + sc + ": " + e.getMessage());
         }
     }
 
@@ -115,11 +149,15 @@ public class Server {
         }
     }
 
-
     public void exit() {
         if (!running) return;
         running = false;
         System.out.println("Завершение работы сервера...");
+
+        readPool.shutdown();
+        processingPool.shutdown();
+        sendPool.shutdown();
+
         if (selector != null && selector.isOpen()) {
             selector.wakeup();
             try {
@@ -140,9 +178,7 @@ public class Server {
                 String line;
                 while (running) {
                     line = reader.readLine();
-                    if (line == null) {
-                        break;
-                    }
+                    if (line == null) break;
                     line = line.trim().toLowerCase();
                     if ("exit".equals(line)) {
                         System.out.println("Получена команда завершения из консоли.");
@@ -157,5 +193,4 @@ public class Server {
         consoleThread.setDaemon(false);
         consoleThread.start();
     }
-
 }
